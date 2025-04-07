@@ -1,5 +1,16 @@
 
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { 
+  collection, 
+  query, 
+  orderBy, 
+  onSnapshot, 
+  addDoc, 
+  serverTimestamp,
+  doc,
+  updateDoc
+} from 'firebase/firestore';
+import { db, auth } from '../lib/firebase';
 
 interface ChatWindowProps {
   chatId: string;
@@ -9,32 +20,155 @@ interface ChatWindowProps {
 interface Message {
   id: string;
   text: string;
-  isMe: boolean;
-  timestamp: string;
+  senderId: string;
+  timestamp: any;
+  isMe?: boolean;
 }
 
 const ChatWindow: React.FC<ChatWindowProps> = ({ chatId, chatName }) => {
   const [newMessage, setNewMessage] = useState('');
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const messagesEndRef = useRef<HTMLDivElement>(null);
   
-  // Mock messages
-  const [messages, setMessages] = useState<Message[]>([
-    { id: '1', text: 'مرحبا، كيف حالك؟', isMe: false, timestamp: '10:30' },
-    { id: '2', text: 'أهلا! أنا بخير، شكرا لك. وأنت؟', isMe: true, timestamp: '10:31' },
-    { id: '3', text: 'أنا بخير أيضا. هل انتهيت من المشروع؟', isMe: false, timestamp: '10:32' },
-    { id: '4', text: 'نعم، أرسلت لك الملفات بالبريد الإلكتروني', isMe: true, timestamp: '10:33' },
-  ]);
+  // التمرير إلى آخر رسالة عند إضافة رسائل جديدة
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
 
-  const handleSendMessage = (e: React.FormEvent) => {
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  // تحميل الرسائل من Firestore
+  useEffect(() => {
+    if (!chatId) return;
+    
+    const currentUser = auth.currentUser;
+    if (!currentUser) return;
+
+    setLoading(true);
+    
+    // إعادة تعيين عدد الرسائل غير المقروءة
+    const resetUnreadCount = async () => {
+      try {
+        const chatRef = doc(db, 'chats', chatId);
+        await updateDoc(chatRef, {
+          [`unreadCount.${currentUser.uid}`]: 0
+        });
+      } catch (err) {
+        console.error('Error resetting unread count:', err);
+      }
+    };
+    
+    resetUnreadCount();
+    
+    // استعلام للحصول على الرسائل
+    const messagesQuery = query(
+      collection(db, 'chats', chatId, 'messages'),
+      orderBy('timestamp', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(
+      messagesQuery,
+      (snapshot) => {
+        try {
+          const messagesData: Message[] = snapshot.docs.map(doc => {
+            const data = doc.data();
+            return {
+              id: doc.id,
+              text: data.text,
+              senderId: data.senderId,
+              timestamp: data.timestamp,
+              isMe: data.senderId === currentUser.uid
+            };
+          });
+          
+          setMessages(messagesData);
+          setLoading(false);
+        } catch (err) {
+          console.error('Error processing messages:', err);
+          setError('حدث خطأ أثناء تحميل الرسائل.');
+          setLoading(false);
+        }
+      },
+      (err) => {
+        console.error('Error fetching messages:', err);
+        setError('حدث خطأ أثناء تحميل الرسائل.');
+        setLoading(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [chatId]);
+
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (newMessage.trim()) {
-      const newMsg: Message = {
-        id: Date.now().toString(),
+    
+    if (!newMessage.trim() || !chatId) return;
+    
+    const currentUser = auth.currentUser;
+    if (!currentUser) return;
+    
+    try {
+      // إضافة الرسالة إلى مجموعة الرسائل
+      await addDoc(collection(db, 'chats', chatId, 'messages'), {
         text: newMessage,
-        isMe: true,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      };
-      setMessages([...messages, newMsg]);
+        senderId: currentUser.uid,
+        timestamp: serverTimestamp()
+      });
+      
+      // تحديث آخر رسالة ووقت التحديث في المحادثة
+      const chatRef = doc(db, 'chats', chatId);
+      
+      // الحصول على معرفات المشاركين الآخرين
+      const otherParticipants = messages
+        .map(msg => msg.senderId)
+        .filter(id => id !== currentUser.uid && id);
+      
+      // إنشاء كائن unreadCount للتحديث
+      const unreadUpdate: Record<string, number> = {};
+      otherParticipants.forEach(id => {
+        if (id) {
+          unreadUpdate[id] = 1; // يمكن زيادته إذا كان هناك قيمة موجودة
+        }
+      });
+      
+      await updateDoc(chatRef, {
+        lastMessage: newMessage,
+        updatedAt: serverTimestamp(),
+        ...(Object.keys(unreadUpdate).length > 0 ? { unreadCount: unreadUpdate } : {})
+      });
+      
       setNewMessage('');
+    } catch (err) {
+      console.error('Error sending message:', err);
+      setError('حدث خطأ أثناء إرسال الرسالة.');
+    }
+  };
+  
+  // Mock messages for development
+  const mockMessages: Message[] = [
+    { id: '1', text: 'مرحبا، كيف حالك؟', senderId: 'other', timestamp: new Date(Date.now() - 300000), isMe: false },
+    { id: '2', text: 'أهلا! أنا بخير، شكرا لك. وأنت؟', senderId: 'current', timestamp: new Date(Date.now() - 240000), isMe: true },
+    { id: '3', text: 'أنا بخير أيضا. هل انتهيت من المشروع؟', senderId: 'other', timestamp: new Date(Date.now() - 180000), isMe: false },
+    { id: '4', text: 'نعم، أرسلت لك الملفات بالبريد الإلكتروني', senderId: 'current', timestamp: new Date(Date.now() - 120000), isMe: true },
+  ];
+
+  // استخدام البيانات الوهمية إذا لم تكن هناك بيانات فعلية
+  const displayMessages = messages.length > 0 ? messages : mockMessages;
+
+  // تنسيق الطابع الزمني
+  const formatMessageTime = (timestamp: any): string => {
+    if (!timestamp) return '';
+    
+    try {
+      const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (err) {
+      console.error('Error formatting message time:', err);
+      return '';
     }
   };
 
@@ -48,25 +182,41 @@ const ChatWindow: React.FC<ChatWindowProps> = ({ chatId, chatName }) => {
         <h2 className="text-xl font-semibold">{chatName}</h2>
       </div>
       
+      {/* Error message */}
+      {error && (
+        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 text-center">
+          {error}
+        </div>
+      )}
+      
       {/* Messages area */}
       <div className="flex-1 p-4 overflow-y-auto bg-[#e5ded8]">
-        <div className="space-y-3">
-          {messages.map((message) => (
-            <div
-              key={message.id}
-              className={`flex ${message.isMe ? 'justify-end' : 'justify-start'}`}
-            >
+        {loading ? (
+          <div className="flex justify-center p-4">
+            <p>جاري تحميل الرسائل...</p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {displayMessages.map((message) => (
               <div
-                className={`max-w-[70%] p-3 rounded-lg ${
-                  message.isMe ? 'bg-green-100' : 'bg-white'
-                }`}
+                key={message.id}
+                className={`flex ${message.isMe ? 'justify-end' : 'justify-start'}`}
               >
-                <p>{message.text}</p>
-                <p className="text-right text-xs text-gray-500 mt-1">{message.timestamp}</p>
+                <div
+                  className={`max-w-[70%] p-3 rounded-lg ${
+                    message.isMe ? 'bg-green-100' : 'bg-white'
+                  }`}
+                >
+                  <p>{message.text}</p>
+                  <p className="text-right text-xs text-gray-500 mt-1">
+                    {formatMessageTime(message.timestamp)}
+                  </p>
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
+        )}
       </div>
       
       {/* Message input */}
